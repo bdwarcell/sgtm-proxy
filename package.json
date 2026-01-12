@@ -1,6 +1,7 @@
 {
-    "name": "sgtm-smart-proxy",
+    "name": "sgtm-proxy",
     "version": "1.0.0",
+    "description": "High-performance Node.js Proxy for sGTM using Redis",
     "main": "index.js",
     "scripts": {
         "start": "node index.js"
@@ -8,5 +9,10 @@
     "dependencies": {
         "http-proxy": "^1.18.1",
         "ioredis": "^5.3.2"
-    }
+    },
+    "engines": {
+        "node": ">=16.0.0"
+    },
+    "author": "Otut.io",
+    "license": "ISC"
 }

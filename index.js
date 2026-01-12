@@ -2,48 +2,76 @@ const http = require('http');
 const httpProxy = require('http-proxy');
 const Redis = require('ioredis');
 
-// ১. প্রক্সি সার্ভার এবং রেডিস কানেকশন তৈরি
+// 1. Initialize Redis Connection
+const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+const redis = new Redis(redisUrl);
+
+redis.on('connect', () => console.log('✅ Connected to Redis'));
+redis.on('error', (err) => console.error('❌ Redis Error:', err));
+
+// 2. Initialize Proxy Server
 const proxy = httpProxy.createProxyServer({
-    xfwd: true // অরিজিনাল IP ঠিক রাখার জন্য জরুরি
+    xfwd: true, // Adds X-Forwarded-For headers
+    secure: false // Disable SSL verification for internal container traffic if needed
 });
 
-// Coolify থেকে REDIS_URL এনভায়রনমেন্ট ভেরিয়েবল আসবে
-const redis = new Redis(process.env.REDIS_URL);
-
-const server = http.createServer(async (req, res) => {
-    try {
-        const host = req.headers.host;
-
-        // ২. Redis থেকে চেক করা: এই ডোমেইন কোন কন্টেইনারে যাবে?
-        // আমরা Redis Key ফরম্যাট ধরে নিচ্ছি: "route:domain.com"
-        const targetContainer = await redis.get(`route:${host}`);
-
-        if (!targetContainer) {
-            console.error(`No route found for: ${host}`);
-            res.writeHead(404, { 'Content-Type': 'text/plain' });
-            res.end("Tracking Error: Container not linked in SaaS Platform.");
-            return;
-        }
-
-        // ৩. বিলিং কাউন্টার আপডেট করা (খুবই দ্রুত হয়)
-        // Key ফরম্যাট: "usage:domain.com:2023-10" (মাসের নাম দিলে বিলিং সহজ হয়)
-        // আপাতত আমরা সিম্পল রাখছি:
-        redis.incr(`usage:${host}`);
-
-        // ৪. ট্রাফিক ফরওয়ার্ড করা (sGTM এর কাছে)
-        // targetContainer হতে হবে: "http://container_name:8080"
-        proxy.web(req, res, { target: targetContainer }, (err) => {
-            console.error("Proxy Error:", err);
-            res.writeHead(502);
-            res.end("Bad Gateway: sGTM Container is down.");
-        });
-
-    } catch (error) {
-        console.error("System Error:", error);
-        res.writeHead(500);
-        res.end("Internal Server Error");
+// Global Error Handler for Proxy
+proxy.on('error', (err, req, res) => {
+    console.error('❌ Proxy Error:', err.message);
+    if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Bad Gateway', message: 'Could not reach sGTM container' }));
     }
 });
 
-console.log("TrackingOps Proxy Running on Port 80...");
-server.listen(80);
+// 3. Create HTTP Server
+const server = http.createServer(async (req, res) => {
+    // Health Check Endpoint
+    if (req.url === '/health' || req.url === '/healthy') {
+        res.writeHead(200);
+        return res.end('OK');
+    }
+
+    const host = req.headers.host;
+
+    if (!host) {
+        res.writeHead(400);
+        return res.end('Missing Host Header');
+    }
+
+    try {
+        // 4. Redis Lookup: Get Target URL
+        const routeKey = `route:${host}`;
+        const target = await redis.get(routeKey);
+
+        if (!target) {
+            console.warn(`⚠️ No route found for host: ${host}`);
+            res.writeHead(404);
+            return res.end('Route not found');
+        }
+
+        // 5. Billing: Fire and forget counter increment
+        const usageKey = `usage:${host}`;
+        redis.incr(usageKey).catch(err => console.error('⚠️ Failed to increment usage:', err));
+
+        // 6. Forward Traffic
+        // native http + http-proxy preserves the stream automatically (POST body intact)
+        proxy.web(req, res, { target: target }, (e) => {
+            // This callback is only for errors in the `proxy.web` call setup itself,
+            // connection errors are handled by proxy.on('error') above.
+            console.error('Proxy web error:', e);
+        });
+
+    } catch (error) {
+        console.error('❌ Internal Server Error:', error);
+        if (!res.headersSent) {
+            res.writeHead(500);
+            res.end('Internal Server Error');
+        }
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🚀 sGTM Proxy running on port ${PORT}`);
+});
